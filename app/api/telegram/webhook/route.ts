@@ -494,7 +494,23 @@ export async function POST(req: NextRequest) {
       await handleAdminCommand(message)
       return Response.json({ ok: true })
     }
+    // /admin — приватна кнопка в адмінку, працює тільки для адмінів
+    if (/^\/admin(?:@\w+)?\s*$/i.test(text.trim())) {
+      if (!isAdmin(from.id)) {
+        return Response.json({ ok: true })
+      }
+      await telegramApi("sendMessage", {
+        chat_id: chatId,
+        text: "🔐 Admin panel",
+        reply_markup: {
+          inline_keyboard: [[{ text: "⚙️ Open Admin Panel", web_app: { url: `${webAppUrl()}/admin` } }]],
+        },
+      })
+      return Response.json({ ok: true })
+    }
 
+    // /start
+    if (isStartText(text)) {
     // /start
     if (isStartText(text)) {
       // Check ban
