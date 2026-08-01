@@ -31,7 +31,7 @@ export function DepositModal({ onClose }: { onClose: () => void }) {
   const [promoLoading, setPromoLoading] = useState(false)
   const [appliedBonus, setAppliedBonus] = useState<{ percent: number; code: string } | null>(null)
 
-  async function sendTon() {
+async function sendTon() {
     const n = Number.parseFloat(tonAmt)
     if (!n || n < MIN_DEPOSIT) return toast(t("deposit.minAmount", { n: MIN_DEPOSIT }), "error")
     if (!walletAddress) {
@@ -40,40 +40,79 @@ export function DepositModal({ onClose }: { onClose: () => void }) {
       return
     }
     setSending(true)
+
+    // Крок 1 — сама відправка в гаманці. Якщо тут кинуло помилку — це справді
+    // відмова/скасування користувачем, це єдине місце, де показуємо "cancelled".
+    let result: any
     try {
-      const result = await tonConnectUI.sendTransaction({
+      result = await tonConnectUI.sendTransaction({
         validUntil: Math.floor(Date.now() / 1000) + 360,
         messages: [{ address: TREASURY_WALLET, amount: Math.round(n * 1e9).toString() }],
       })
-      const bonus = appliedBonus ? Math.round(n * (appliedBonus.percent / 100) * 1000) / 1000 : 0
-      const total = Math.round((n + bonus) * 1000) / 1000
-
-      if (isTelegram()) {
-        await new Promise((r) => setTimeout(r, 4000))
-        const boc = String((result as any)?.boc || "")
-        const credited = await confirmTonDeposit({
-          amount: n,
-          boc,
-          txHash: boc ? await sha256Hex(boc) : undefined,
-          fromAddress: walletAddress,
-        })
-        setTon(credited.ton)
-        await refreshFromServer().catch(() => {})
-        toast(t("deposit.success", { n }), "win")
-        setAppliedBonus(null)
-      } else {
-        addTon(total)
-        recordDeposit(total)
-        if (bonus > 0) toast(t("deposit.depositedBonus", { n, b: bonus, p: appliedBonus!.percent, t: total }), "win")
-        else toast(t("deposit.success", { n: total }), "win")
-        setAppliedBonus(null)
-      }
-      onClose()
     } catch {
       toast(t("deposit.cancelled"), "error")
-    } finally {
       setSending(false)
+      return
     }
+
+    // Гроші вже пішли з гаманця (незворотньо). Далі — лише підтвердження
+    // на сервері, помилки тут НЕ означають "скасовано".
+    const bonus = appliedBonus ? Math.round(n * (appliedBonus.percent / 100) * 1000) / 1000 : 0
+    const total = Math.round((n + bonus) * 1000) / 1000
+
+    if (isTelegram()) {
+      const boc = String(result?.boc || "")
+      const txHash = boc ? await sha256Hex(boc) : undefined
+
+      toast(t("deposit.confirming") || "Підтверджуємо оплату…", "info")
+
+      // Блокчейн TON індексується не миттєво — пробуємо кілька разів
+      // із зростаючою паузою замість однієї спроби через 4 сек.
+      const delays = [4000, 6000, 8000, 10000, 12000, 15000] // ~55 сек. сумарно
+      let lastError: any = null
+      for (const delay of delays) {
+        await new Promise((r) => setTimeout(r, delay))
+        try {
+          const credited = await confirmTonDeposit({ amount: n, boc, txHash, fromAddress: walletAddress })
+          setTon(credited.ton)
+          await refreshFromServer().catch(() => {})
+          toast(t("deposit.success", { n }), "win")
+          setAppliedBonus(null)
+          onClose()
+          setSending(false)
+          return
+        } catch (e) {
+          lastError = e
+          // "already_credited" означає що попередня спроба таки зарахувала —
+          // просто оновлюємо баланс і виходимо, це успіх, а не помилка.
+          if (String((e as any)?.message || "").includes("already_credited")) {
+            await refreshFromServer().catch(() => {})
+            toast(t("deposit.success", { n }), "win")
+            onClose()
+            setSending(false)
+            return
+          }
+          // інакше — пробуємо ще раз (транзакція ще не проіндексована)
+        }
+      }
+
+      // Усі спроби вичерпано, але оплата в гаманці ПІДТВЕРДЖЕНА — не кажемо "cancelled".
+      console.error("[deposit] confirm failed after retries:", lastError)
+      toast(
+        t("deposit.pendingConfirmation") ||
+          "Оплата пройшла, але зарахування затримується. Баланс з'явиться протягом кількох хвилин, або зверніться до підтримки.",
+        "info",
+      )
+      onClose()
+    } else {
+      addTon(total)
+      recordDeposit(total)
+      if (bonus > 0) toast(t("deposit.depositedBonus", { n, b: bonus, p: appliedBonus!.percent, t: total }), "win")
+      else toast(t("deposit.success", { n: total }), "win")
+      setAppliedBonus(null)
+      onClose()
+    }
+    setSending(false)
   }
 
   async function sha256Hex(str: string) {
