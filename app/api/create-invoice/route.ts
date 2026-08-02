@@ -36,12 +36,17 @@ export async function POST(req: NextRequest) {
   let payload: string
   if (isWithdraw) {
     const requiredFee = await getWithdrawFee()
+    console.error("[v0] withdraw debug: stars=", stars, "requiredFee=", requiredFee, "nftUid=", body.nftUid, "nftId=", body.nftId)
     if (stars !== requiredFee) {
+      console.error("[v0] withdraw failed: invalid_fee", { stars, requiredFee })
       return Response.json({ error: "invalid_fee", required: requiredFee }, { status: 400 })
     }
     const nftUid = String(body.nftUid || "")
     const nftId = String(body.nftId || "")
-    if (!nftUid || !nftId) return Response.json({ error: "missing nft" }, { status: 400 })
+    if (!nftUid || !nftId) {
+      console.error("[v0] withdraw failed: missing nft", { nftUid, nftId, rawBody: body })
+      return Response.json({ error: "missing nft" }, { status: 400 })
+    }
 
     const invoiceId = `wd_${user.id}_${crypto.randomBytes(6).toString("hex")}`
     await pool.query(
