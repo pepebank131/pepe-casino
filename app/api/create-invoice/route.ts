@@ -36,7 +36,6 @@ export async function POST(req: NextRequest) {
   let payload: string
   if (isWithdraw) {
     const requiredFee = await getWithdrawFee()
-    console.error("[v0] withdraw debug: stars=", stars, "requiredFee=", requiredFee, "nftUid=", body.nftUid, "nftId=", body.nftId)
     if (stars !== requiredFee) {
       console.error("[v0] withdraw failed: invalid_fee", { stars, requiredFee })
       return Response.json({ error: "invalid_fee", required: requiredFee }, { status: 400 })
@@ -67,12 +66,12 @@ export async function POST(req: NextRequest) {
       [invoiceId, user.id, stars, nftUid, Date.now()],
     )
 
+    // Telegram limits invoice payload to 128 bytes. uid/nft_uid/nft_id are
+    // already persisted in stars_invoice_intents above and the webhook reads
+    // them back from there via invoiceId — so keep the payload minimal here.
     payload = JSON.stringify({
       type: "nft_withdraw",
       invoiceId,
-      uid: String(user.id),
-      nft_uid: nftUid,
-      nft_id: nftId,
     })
   } else {
     if (stars > MAX_STARS_DEPOSIT) {
