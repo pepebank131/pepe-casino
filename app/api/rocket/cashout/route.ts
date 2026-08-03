@@ -26,7 +26,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: res.error }, { status })
     }
     return NextResponse.json(
-      { multiplier: res.multiplier, won: res.won, state: res.state, ton: res.ton },
+      { multiplier: res.multiplier, won: res.won, nft: res.nft, state: res.state, ton: res.ton },
       { headers: { "Cache-Control": "no-store" } },
     )
   } catch (e) {
