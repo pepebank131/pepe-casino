@@ -49,6 +49,7 @@ export async function POST(req: NextRequest) {
 
   const client = await pool.connect()
   try {
+    await client.query("BEGIN")
     await client.query(
       `CREATE TABLE IF NOT EXISTS ton_deposit_credits (
          tx_hash TEXT PRIMARY KEY,
@@ -57,35 +58,36 @@ export async function POST(req: NextRequest) {
          created_at BIGINT NOT NULL
        )`,
     )
-    const dupe = await client.query(`SELECT 1 FROM ton_deposit_credits WHERE tx_hash = $1`, [txKey])
+    const dupe = await client.query(`SELECT 1 FROM ton_deposit_credits WHERE tx_hash = $1 FOR UPDATE`, [txKey])
     if (dupe.rows.length) {
+      await client.query("ROLLBACK")
       return Response.json({ error: "already_credited" }, { status: 409 })
     }
     await client.query(
       `INSERT INTO ton_deposit_credits (tx_hash, user_id, amount, created_at) VALUES ($1,$2,$3,$4)`,
       [txKey, user.id, amount, Date.now()],
     )
+
+    // Credit runs inside this same transaction (via externalClient) so the
+    // dedupe lock above and the balance credit either both commit or both
+    // roll back — a mid-way failure can no longer "eat" a deposit.
+    const ton = await creditBalance(
+      user.id,
+      amount,
+      { username: user.username, photo: user.photoUrl, method: "ton", applyDepositBonus: true },
+      client,
+    )
+    await client.query("COMMIT")
+    return Response.json({ ton, amount })
   } catch (e: any) {
+    await client.query("ROLLBACK").catch(() => {})
     if (String(e?.code) === "23505") {
       return Response.json({ error: "already_credited" }, { status: 409 })
     }
-    console.error("[v0] ton deposit lock error:", e)
-    return Response.json({ error: "server error" }, { status: 500 })
-  } finally {
-    client.release()
-  }
-
-  try {
-    const ton = await creditBalance(user.id, amount, {
-      username: user.username,
-      photo: user.photoUrl,
-      method: "ton",
-      applyDepositBonus: true,
-    })
-    return Response.json({ ton, amount })
-  } catch (e) {
     console.error("[v0] ton deposit credit error:", e)
     return Response.json({ error: "credit_failed" }, { status: 500 })
+  } finally {
+    client.release()
   }
 }
 
