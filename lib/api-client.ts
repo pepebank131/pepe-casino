@@ -97,6 +97,13 @@ export async function playUpgradeApi(stakeUid: string, targetId: string): Promis
   return post("/api/upgrade", { initData: getInitData(), stakeUid, targetId })
 }
 
+export async function playCoinFlipApi(
+  amount: number,
+  side: "pepe" | "ton",
+): Promise<{ result: "pepe" | "ton"; win: boolean; payout: number; ton: number }> {
+  return post("/api/coinflip", { initData: getInitData(), amount, side })
+}
+
 export async function sellInventoryApi(nftUid: string): Promise<{ ton: number; soldFor: number }> {
   return post("/api/inventory/sell", { initData: getInitData(), nftUid })
 }
@@ -561,7 +568,13 @@ export async function placeRocketBet(amount: number): Promise<RocketState & { to
 }
 
 // Cash out the caller's active bet. Returns winning multiplier + won TON.
-export async function cashoutRocket(): Promise<{ multiplier: number; won: number; state: RocketState; ton?: number }> {
+export async function cashoutRocket(): Promise<{
+  multiplier: number
+  won: number
+  nft?: { uid: string; id: string; name: string; rarity: string; price: number; img: string }
+  state: RocketState
+  ton?: number
+}> {
   return post("/api/rocket/cashout", { initData: getInitData() })
 }
 
