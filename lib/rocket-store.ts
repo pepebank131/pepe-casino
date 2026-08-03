@@ -1,5 +1,7 @@
+import crypto from "crypto"
 import { pool, query } from "@/lib/db"
 import { getGlobalRtp } from "@/lib/rtp-store"
+import { bestRocketNftForWinnings } from "@/lib/casino-data"
 
 // ---------------------------------------------------------------------------
 // Server-authoritative multiplayer state for the Rocket (crash) game.
@@ -343,7 +345,15 @@ export async function placeRocketBet(input: {
 // server time, not the client, so it can't be gamed.
 export async function cashoutRocketBet(
   userId: string,
-): Promise<{ ok: boolean; error?: string; multiplier?: number; won?: number; state?: RocketState; ton?: number }> {
+): Promise<{
+  ok: boolean
+  error?: string
+  multiplier?: number
+  won?: number
+  state?: RocketState
+  ton?: number
+  nft?: { uid: string; id: string; name: string; rarity: string; price: number; img: string }
+}> {
   const round = await advanceGame()
   if (round.status !== "flying") {
     return { ok: false, error: "not_flying" }
@@ -371,8 +381,40 @@ export async function cashoutRocketBet(
     const won = Number(betUpd.rows[0].won) || 0
     const prow = await client.query(`SELECT data FROM players WHERE uid = $1 FOR UPDATE`, [userId])
     const data = prow.rows[0]?.data || {}
-    const nextBal = Math.round(((Number(data.balance) || 0) + won) * 1000) / 1000
-    await client.query(`UPDATE players SET data = $2 WHERE uid = $1`, [userId, { ...data, balance: nextBal }])
+
+    // Big enough win → award the matching NFT instead of TON (this is the
+    // mechanic the UI promises: "Заберите при X+ TON, щоб виграти NFT").
+    // Same threshold as the demo-mode simulation: multiplier >= 1.1 and the
+    // TON amount reaches at least the cheapest catalog NFT's floor price.
+    const wonNftCat = m >= 1.1 ? bestRocketNftForWinnings(won) : null
+    let nextBal = Number(data.balance) || 0
+    const nfts: any[] = Array.isArray(data.nfts) ? [...data.nfts] : []
+    let awardedNft: { uid: string; id: string; name: string; rarity: string; price: number; img: string } | undefined
+
+    if (wonNftCat) {
+      const nftUid = `${wonNftCat.id}_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`
+      nfts.unshift({
+        id: wonNftCat.id,
+        uid: nftUid,
+        name: wonNftCat.name,
+        price: wonNftCat.price,
+        floor: wonNftCat.price,
+        rarity: wonNftCat.rarity,
+        ts: Date.now() / 1000,
+      })
+      awardedNft = {
+        uid: nftUid,
+        id: wonNftCat.id,
+        name: wonNftCat.name,
+        rarity: wonNftCat.rarity,
+        price: wonNftCat.price,
+        img: wonNftCat.img,
+      }
+      await client.query(`UPDATE players SET data = $2 WHERE uid = $1`, [userId, { ...data, nfts }])
+    } else {
+      nextBal = Math.round((nextBal + won) * 1000) / 1000
+      await client.query(`UPDATE players SET data = $2 WHERE uid = $1`, [userId, { ...data, balance: nextBal }])
+    }
     await client.query("COMMIT")
 
     const bet = toBet(betUpd.rows[0])
@@ -381,6 +423,7 @@ export async function cashoutRocketBet(
       ok: true,
       multiplier: m,
       won: bet.won ?? 0,
+      nft: awardedNft,
       state: publicState(round, bets, await crashHistory()),
       ton: nextBal,
     }
