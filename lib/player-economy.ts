@@ -71,14 +71,19 @@ export async function creditBalance(
     /** Apply + clear pending_deposit_bonus_percent from player data. */
     applyDepositBonus?: boolean
   },
+  /** If provided, run inside the caller's already-open transaction instead of
+   *  opening/committing our own — so the caller's dedupe-lock write and this
+   *  credit either both land or both roll back together. */
+  externalClient?: any,
 ): Promise<number> {
   if (!Number.isFinite(amount) || amount <= 0) throw new Error("invalid_amount")
-  const client = await pool.connect()
+  const client = externalClient || (await pool.connect())
+  const ownsTx = !externalClient
   try {
-    await client.query("BEGIN")
+    if (ownsTx) await client.query("BEGIN")
     const data = await lockPlayer(client, uid)
     if ((data as any).banned) {
-      await client.query("ROLLBACK")
+      if (ownsTx) await client.query("ROLLBACK")
       throw new Error("banned")
     }
     let credit = amount
@@ -97,7 +102,7 @@ export async function creditBalance(
       ...(meta?.applyDepositBonus && pendingPct > 0 ? { pending_deposit_bonus_percent: 0 } : {}),
     }
     await savePlayer(client, uid, next)
-    await client.query("COMMIT")
+    if (ownsTx) await client.query("COMMIT")
     if (meta?.logDeposit !== false) {
       await ensureActivityTables()
       await logDeposit({
@@ -110,12 +115,13 @@ export async function creditBalance(
     }
     return nextBal
   } catch (e) {
-    await client.query("ROLLBACK").catch(() => {})
+    if (ownsTx) await client.query("ROLLBACK").catch(() => {})
     throw e
   } finally {
-    client.release()
+    if (ownsTx) client.release()
   }
 }
+
 
 /** Store a one-shot deposit bonus % after redeeming a percent promo. */
 export async function setPendingDepositBonus(uid: string, percent: number): Promise<void> {
@@ -354,6 +360,59 @@ export async function sellInventoryItem(user: TgUser, nftUid: string): Promise<{
     await savePlayer(client, user.id, { ...data, balance: ton, nfts })
     await client.query("COMMIT")
     return { ton, soldFor }
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {})
+    throw e
+  } finally {
+    client.release()
+  }
+}
+
+const COINFLIP_MIN_BET = 0.1
+const COINFLIP_MAX_BET = 1000
+const COINFLIP_PAYOUT_MULTIPLIER = 1.96
+
+export type CoinFlipSide = "pepe" | "ton"
+
+/** Server-authoritative coin flip: secure RNG, atomic debit+credit in one row lock. */
+export async function playCoinFlipServer(
+  user: TgUser,
+  amount: number,
+  side: CoinFlipSide,
+): Promise<{ result: CoinFlipSide; win: boolean; payout: number; ton: number }> {
+  if (side !== "pepe" && side !== "ton") throw new Error("invalid_side")
+  if (!Number.isFinite(amount) || amount < COINFLIP_MIN_BET || amount > COINFLIP_MAX_BET) {
+    throw new Error("invalid_amount")
+  }
+  const bet = round3(amount)
+  const rtp = Math.max(1, Math.min(99, Math.round(await getGlobalRtp())))
+
+  const client = await pool.connect()
+  try {
+    await client.query("BEGIN")
+    const data = await lockPlayer(client, user.id)
+    if ((data as any).banned) {
+      await client.query("ROLLBACK")
+      throw new Error("banned")
+    }
+    const bal = Number(data.balance) || 0
+    if (bal < bet) {
+      await client.query("ROLLBACK")
+      throw new Error("insufficient_balance")
+    }
+
+    // Same formula as the demo build: win-guess probability = rtp/196, payout
+    // 1.96x on a correct guess, so expected return = (rtp/196)*1.96 = rtp%.
+    const winProb = rtp / 196
+    const guessedCorrectly = secureRandom() < winProb
+    const result: CoinFlipSide = guessedCorrectly ? side : side === "pepe" ? "ton" : "pepe"
+    const payout = guessedCorrectly ? round3(bet * COINFLIP_PAYOUT_MULTIPLIER) : 0
+    const nextBal = round3(bal - bet + payout)
+
+    await savePlayer(client, user.id, { ...data, balance: nextBal })
+    await client.query("COMMIT")
+
+    return { result, win: guessedCorrectly, payout, ton: nextBal }
   } catch (e) {
     await client.query("ROLLBACK").catch(() => {})
     throw e
