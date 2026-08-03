@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server"
-import { query, type PlayerData } from "@/lib/db"
+import { query, pool, type PlayerData } from "@/lib/db"
 import { creditBalance, createWithdrawalSecure } from "@/lib/player-economy"
 import { getAdminIds } from "@/lib/admin-auth"
 
@@ -406,27 +406,17 @@ export async function POST(req: NextRequest) {
 
       // Require server-issued invoice intent for every payment.
       if (!invoiceId) return Response.json({ ok: true })
-      // Atomically claim the invoice intent (prevents double credit).
-      const claimed = await query<{
-        stars: number
-        user_id: string
-        kind: string
-        nft_uid: string | null
-      }>(
-        `UPDATE stars_invoice_intents SET used_at = $2
-         WHERE id = $1 AND used_at IS NULL AND user_id = $3 AND stars = $4
-         RETURNING stars, user_id, kind, nft_uid`,
-        [invoiceId, Date.now(), payerId, starsPaid],
-      )
-      if (!claimed.length) return Response.json({ ok: true })
-      const intent = claimed[0]
 
-      if (chargeId) {
-        const dup = await query(`SELECT 1 FROM stars_deposit_credits WHERE charge_id = $1`, [chargeId])
-        if (dup.length) return Response.json({ ok: true })
-      }
-
-      if (payload?.type === "nft_withdraw" || intent.kind === "withdraw") {
+      if (payload?.type === "nft_withdraw") {
+        // Withdraw: claim intent, then hand off to admin-fulfilled withdrawal queue.
+        const claimed = await query<{ stars: number; user_id: string; kind: string; nft_uid: string | null }>(
+          `UPDATE stars_invoice_intents SET used_at = $2
+           WHERE id = $1 AND used_at IS NULL AND user_id = $3 AND stars = $4
+           RETURNING stars, user_id, kind, nft_uid`,
+          [invoiceId, Date.now(), payerId, starsPaid],
+        )
+        if (!claimed.length) return Response.json({ ok: true })
+        const intent = claimed[0]
         const nftUid = String(intent.nft_uid || "")
         if (!nftUid) return Response.json({ ok: true })
         if (chargeId) {
@@ -443,18 +433,50 @@ export async function POST(req: NextRequest) {
         return Response.json({ ok: true })
       }
 
-      // Deposit: credit from Stars paid (+ pending % promo bonus on server).
-      const baseTon = Math.round(starsPaid * TON_PER_STAR * 1000) / 1000
-      if (baseTon <= 0) return Response.json({ ok: true })
-      if (chargeId) {
-        await query(`INSERT INTO stars_deposit_credits (charge_id, user_id, amount, created_at) VALUES ($1,$2,$3,$4)`, [
-          chargeId,
-          payerId,
-          baseTon,
-          Date.now(),
-        ])
+      // Deposit: claim the invoice intent, dedupe the charge, and credit the
+      // balance all inside ONE transaction. If any step fails, everything
+      // rolls back together — no more "intent/charge marked used but balance
+      // never credited" and the payment can be safely reprocessed on retry.
+      const depositClient = await pool.connect()
+      try {
+        await depositClient.query("BEGIN")
+        const claimed = await depositClient.query<{ stars: number; user_id: string; kind: string; nft_uid: string | null }>(
+          `UPDATE stars_invoice_intents SET used_at = $2
+           WHERE id = $1 AND used_at IS NULL AND user_id = $3 AND stars = $4
+           RETURNING stars, user_id, kind, nft_uid`,
+          [invoiceId, Date.now(), payerId, starsPaid],
+        )
+        if (!claimed.rows.length) {
+          await depositClient.query("ROLLBACK")
+          return Response.json({ ok: true })
+        }
+        if (chargeId) {
+          const dup = await depositClient.query(`SELECT 1 FROM stars_deposit_credits WHERE charge_id = $1 FOR UPDATE`, [chargeId])
+          if (dup.rows.length) {
+            await depositClient.query("ROLLBACK")
+            return Response.json({ ok: true })
+          }
+        }
+
+        const baseTon = Math.round(starsPaid * TON_PER_STAR * 1000) / 1000
+        if (baseTon <= 0) {
+          await depositClient.query("ROLLBACK")
+          return Response.json({ ok: true })
+        }
+        if (chargeId) {
+          await depositClient.query(
+            `INSERT INTO stars_deposit_credits (charge_id, user_id, amount, created_at) VALUES ($1,$2,$3,$4)`,
+            [chargeId, payerId, baseTon, Date.now()],
+          )
+        }
+        await creditBalance(payerId, baseTon, { username, method: "stars", applyDepositBonus: true }, depositClient)
+        await depositClient.query("COMMIT")
+      } catch (e) {
+        await depositClient.query("ROLLBACK").catch(() => {})
+        console.error("[telegram] stars deposit credit failed:", e)
+      } finally {
+        depositClient.release()
       }
-      await creditBalance(payerId, baseTon, { username, method: "stars", applyDepositBonus: true })
     } catch (e) {
       console.error("[telegram] successful_payment handling failed:", e)
     }
@@ -494,22 +516,7 @@ export async function POST(req: NextRequest) {
       await handleAdminCommand(message)
       return Response.json({ ok: true })
     }
-    // /admin — приватна кнопка в адмінку, працює тільки для адмінів
-    if (/^\/admin(?:@\w+)?\s*$/i.test(text.trim())) {
-      if (!isAdmin(from.id)) {
-        return Response.json({ ok: true })
-      }
-      await telegramApi("sendMessage", {
-        chat_id: chatId,
-        text: "🔐 Admin panel",
-        reply_markup: {
-          inline_keyboard: [[{ text: "⚙️ Open Admin Panel", web_app: { url: `${webAppUrl()}/admin` } }]],
-        },
-      })
-      return Response.json({ ok: true })
-    }
 
-    
     // /start
     if (isStartText(text)) {
       // Check ban
