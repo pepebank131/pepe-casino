@@ -46,7 +46,7 @@ interface CardData {
 }
 
 export function RocketScreen() {
-  const { ton, spendTon, addTon, addToInventory, inventory, removeFromInventory, username, photoUrl, setTon } = useStore()
+  const { ton, spendTon, addTon, addToInventory, inventory, removeFromInventory, username, photoUrl, setTon, refreshFromServer } = useStore()
   const toast = useToast()
   const { t } = useT()
 
@@ -286,9 +286,15 @@ export function RocketScreen() {
       if (inTelegram) {
         const res = await cashoutRocket()
         if (typeof (res as any).ton === "number") setTon((res as any).ton)
-        // Server already credited TON — only show toast (no local NFT mint from client RNG)
         playCashout()
-        toast(`Cashed @ ${res.multiplier.toFixed(2)}x · +${res.won} TON`, "win")
+        if (res.nft) {
+          // Server awarded an NFT instead of TON — pull the authoritative
+          // inventory (with the server-issued uid) rather than faking it locally.
+          await refreshFromServer().catch(() => {})
+          toast(t("rocket.cashedNftToast", { m: res.multiplier.toFixed(2), name: res.nft.name }), "win")
+        } else {
+          toast(`Cashed @ ${res.multiplier.toFixed(2)}x · +${res.won} TON`, "win")
+        }
         setState(res.state)
       } else {
         const m = liveMult
@@ -301,7 +307,7 @@ export function RocketScreen() {
       playError()
       toast(e?.message === "crashed" ? t("rocket.crashedToast", { m: mult.toFixed(2) }) : t("rocket.betValid"), "error")
     }
-  }, [state, iAmIn, inTelegram, liveMult, demoBet, mult, toast, t])
+  }, [state, iAmIn, inTelegram, liveMult, demoBet, mult, toast, t, refreshFromServer])
 
   // Credits winnings. NFT stakes receive a matching NFT prize first; TON is
   // only used as fallback when the win is below the cheapest available NFT.
@@ -730,6 +736,3 @@ function CurveGraph({ mult, crashed, running }: { mult: number; crashed: boolean
     </svg>
   )
 }
-
-
-
