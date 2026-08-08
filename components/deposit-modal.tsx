@@ -28,6 +28,7 @@ export function DepositModal({ onClose }: { onClose: () => void }) {
   // Set when the TonConnect bridge doesn't answer sendTransaction in time —
   // money may already have left the wallet even though we got no callback.
   const [walletStuck, setWalletStuck] = useState(false)
+  const [stuckReason, setStuckReason] = useState<"bridge" | "verify">("bridge")
   const [manualChecking, setManualChecking] = useState(false)
   const pendingAmountRef = useRef<number | null>(null)
 
@@ -42,7 +43,9 @@ export function DepositModal({ onClose }: { onClose: () => void }) {
   // (in which case boc/txHash are empty and the server matches purely by
   // amount + fromAddress against the chain).
   async function confirmWithRetries(n: number, boc: string, txHash: string | undefined): Promise<boolean> {
-    const delays = [4000, 6000, 8000, 10000, 12000, 15000] // ~55 сек. сумарно
+    // Перша спроба майже одразу (блокчейн TON фіналізує блок за ~1-2 сек),
+    // далі — з наростанням, якщо tonapi ще не проіндексував транзакцію.
+    const delays = [1200, 2000, 3000, 4000, 6000, 8000, 10000, 12000] // ~46 сек. сумарно
     let lastError: any = null
     for (const delay of delays) {
       await new Promise((r) => setTimeout(r, delay))
@@ -109,6 +112,7 @@ export function DepositModal({ onClose }: { onClose: () => void }) {
       setSending(false)
       if (timedOut) {
         pendingAmountRef.current = n
+        setStuckReason("bridge")
         setWalletStuck(true)
         return
       }
@@ -133,6 +137,7 @@ export function DepositModal({ onClose }: { onClose: () => void }) {
         // Усі спроби вичерпано, але оплата в гаманці ПІДТВЕРДЖЕНА — не кажемо "cancelled".
         // Пропонуємо ручну перевірку замість того, щоб просто закрити з невизначеністю.
         pendingAmountRef.current = n
+        setStuckReason("verify")
         setWalletStuck(true)
       }
     } else {
@@ -329,7 +334,9 @@ export function DepositModal({ onClose }: { onClose: () => void }) {
               <div className="mb-3 rounded-xl px-3 py-3 text-center text-sm"
                 style={{ background: "rgba(255,214,0,0.08)", border: "1px solid rgba(255,214,0,0.3)" }}>
                 <p className="mb-2 font-semibold text-[#ffe88a]">
-                  Гаманець не відповів вчасно. Якщо ти вже підтвердив оплату в Tonkeeper — перевір ще раз.
+                  {stuckReason === "bridge"
+                    ? "Гаманець не відповів вчасно. Якщо ти вже підтвердив оплату в Tonkeeper — перевір ще раз."
+                    : "Оплата пройшла, але сервер поки не бачить транзакцію в блокчейні. Спробуй перевірити ще раз через хвилину."}
                 </p>
                 <button
                   onClick={checkManually}
@@ -337,7 +344,7 @@ export function DepositModal({ onClose }: { onClose: () => void }) {
                   className="rounded-xl px-4 py-2 text-sm font-bold disabled:opacity-60"
                   style={{ background: "rgba(255,214,0,0.9)", color: "#1a1400" }}
                 >
-                  {manualChecking ? "Перевіряємо…" : "Я вже оплатив — перевірити"}
+                  {manualChecking ? "Перевіряємо…" : "Перевірити ще раз"}
                 </button>
               </div>
             )}
