@@ -34,13 +34,19 @@ export async function POST(req: NextRequest) {
   }
 
   const clientKey = txHashRaw || (boc ? crypto.createHash("sha256").update(boc).digest("hex") : "")
-  if (!clientKey) return Response.json({ error: "missing_tx" }, { status: 400 })
+  // clientKey is only a fallback dedupe key for the (rare) unverified-deposit
+  // dev escape hatch below. The real match comes from the on-chain lookup in
+  // findMatchingTreasuryTx (amount + fromAddress), which needs neither boc nor
+  // txHash — so a hung TonConnect bridge (wallet paid, confirm() never fired
+  // with a boc) can still be manually confirmed with just amount+fromAddress.
 
   const verified = await findMatchingTreasuryTx(amount, fromAddress)
   if (!verified.ok || !verified.chainTxHash) {
-    if (!(process.env.ALLOW_UNVERIFIED_TON_DEPOSITS === "1" && process.env.NODE_ENV !== "production")) {
+    const devUnverified = process.env.ALLOW_UNVERIFIED_TON_DEPOSITS === "1" && process.env.NODE_ENV !== "production"
+    if (!devUnverified) {
       return Response.json({ error: verified.error || "verify_failed" }, { status: 400 })
     }
+    if (!clientKey) return Response.json({ error: "missing_tx" }, { status: 400 })
   }
 
   // Prefer the real chain hash so two users can't claim the same inbound transfer
