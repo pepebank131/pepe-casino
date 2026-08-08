@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useState, useRef } from "react"
 import { useStore } from "@/lib/store"
 import { useToast } from "@/components/toast"
 import { TonIcon, StarIcon } from "@/components/icons"
@@ -25,13 +25,58 @@ export function DepositModal({ onClose }: { onClose: () => void }) {
   const [starAmt, setStarAmt] = useState("250")
   const [sending, setSending] = useState(false)
   const [payingStars, setPayingStars] = useState(false)
+  // Set when the TonConnect bridge doesn't answer sendTransaction in time —
+  // money may already have left the wallet even though we got no callback.
+  const [walletStuck, setWalletStuck] = useState(false)
+  const [manualChecking, setManualChecking] = useState(false)
+  const pendingAmountRef = useRef<number | null>(null)
 
   // Promo state
   const [promoCode, setPromoCode] = useState("")
   const [promoLoading, setPromoLoading] = useState(false)
   const [appliedBonus, setAppliedBonus] = useState<{ percent: number; code: string } | null>(null)
 
-async function sendTon() {
+  // Polls the server to confirm a TON deposit, retrying with growing delays
+  // because the chain isn't indexed instantly. Used both right after a normal
+  // sendTransaction() success AND from the manual "I already paid" fallback
+  // (in which case boc/txHash are empty and the server matches purely by
+  // amount + fromAddress against the chain).
+  async function confirmWithRetries(n: number, boc: string, txHash: string | undefined): Promise<boolean> {
+    const delays = [4000, 6000, 8000, 10000, 12000, 15000] // ~55 сек. сумарно
+    let lastError: any = null
+    for (const delay of delays) {
+      await new Promise((r) => setTimeout(r, delay))
+      try {
+        const credited = await confirmTonDeposit({ amount: n, boc, txHash, fromAddress: walletAddress })
+        setTon(credited.ton)
+        await refreshFromServer().catch(() => {})
+        toast(t("deposit.success", { n }), "win")
+        setAppliedBonus(null)
+        onClose()
+        return true
+      } catch (e) {
+        lastError = e
+        // "already_credited" означає що попередня спроба таки зарахувала —
+        // просто оновлюємо баланс і виходимо, це успіх, а не помилка.
+        if (String((e as any)?.message || "").includes("already_credited")) {
+          await refreshFromServer().catch(() => {})
+          toast(t("deposit.success", { n }), "win")
+          onClose()
+          return true
+        }
+        // інакше — пробуємо ще раз (транзакція ще не проіндексована)
+      }
+    }
+    console.error("[deposit] confirm failed after retries:", lastError)
+    return false
+  }
+
+  // Якщо TonConnect-бридж (Tonkeeper) не відповідає протягом цього часу —
+  // перестаємо чекати і пропонуємо ручну перевірку замість вічного спінера.
+  // Гроші могли вже піти з гаманця навіть без callback'у в браузер.
+  const WALLET_RESPONSE_TIMEOUT_MS = 45_000
+
+  async function sendTon() {
     const n = Number.parseFloat(tonAmt)
     if (!n || n < MIN_DEPOSIT) return toast(t("deposit.minAmount", { n: MIN_DEPOSIT }), "error")
     if (!walletAddress) {
@@ -40,18 +85,34 @@ async function sendTon() {
       return
     }
     setSending(true)
+    setWalletStuck(false)
 
     // Крок 1 — сама відправка в гаманці. Якщо тут кинуло помилку — це справді
     // відмова/скасування користувачем, це єдине місце, де показуємо "cancelled".
+    // Виняток — тайм-аут: бридж міг просто не відповісти, хоча оплата пройшла.
     let result: any
+    let timedOut = false
     try {
-      result = await tonConnectUI.sendTransaction({
-        validUntil: Math.floor(Date.now() / 1000) + 360,
-        messages: [{ address: TREASURY_WALLET, amount: Math.round(n * 1e9).toString() }],
-      })
+      result = await Promise.race([
+        tonConnectUI.sendTransaction({
+          validUntil: Math.floor(Date.now() / 1000) + 360,
+          messages: [{ address: TREASURY_WALLET, amount: Math.round(n * 1e9).toString() }],
+        }),
+        new Promise((_, reject) =>
+          setTimeout(() => {
+            timedOut = true
+            reject(new Error("wallet_timeout"))
+          }, WALLET_RESPONSE_TIMEOUT_MS),
+        ),
+      ])
     } catch {
-      toast(t("deposit.cancelled"), "error")
       setSending(false)
+      if (timedOut) {
+        pendingAmountRef.current = n
+        setWalletStuck(true)
+        return
+      }
+      toast(t("deposit.cancelled"), "error")
       return
     }
 
@@ -66,44 +127,14 @@ async function sendTon() {
 
       toast(t("deposit.confirming") || "Підтверджуємо оплату…", "info")
 
-      // Блокчейн TON індексується не миттєво — пробуємо кілька разів
-      // із зростаючою паузою замість однієї спроби через 4 сек.
-      const delays = [4000, 6000, 8000, 10000, 12000, 15000] // ~55 сек. сумарно
-      let lastError: any = null
-      for (const delay of delays) {
-        await new Promise((r) => setTimeout(r, delay))
-        try {
-          const credited = await confirmTonDeposit({ amount: n, boc, txHash, fromAddress: walletAddress })
-          setTon(credited.ton)
-          await refreshFromServer().catch(() => {})
-          toast(t("deposit.success", { n }), "win")
-          setAppliedBonus(null)
-          onClose()
-          setSending(false)
-          return
-        } catch (e) {
-          lastError = e
-          // "already_credited" означає що попередня спроба таки зарахувала —
-          // просто оновлюємо баланс і виходимо, це успіх, а не помилка.
-          if (String((e as any)?.message || "").includes("already_credited")) {
-            await refreshFromServer().catch(() => {})
-            toast(t("deposit.success", { n }), "win")
-            onClose()
-            setSending(false)
-            return
-          }
-          // інакше — пробуємо ще раз (транзакція ще не проіндексована)
-        }
+      const ok = await confirmWithRetries(n, boc, txHash)
+      setSending(false)
+      if (!ok) {
+        // Усі спроби вичерпано, але оплата в гаманці ПІДТВЕРДЖЕНА — не кажемо "cancelled".
+        // Пропонуємо ручну перевірку замість того, щоб просто закрити з невизначеністю.
+        pendingAmountRef.current = n
+        setWalletStuck(true)
       }
-
-      // Усі спроби вичерпано, але оплата в гаманці ПІДТВЕРДЖЕНА — не кажемо "cancelled".
-      console.error("[deposit] confirm failed after retries:", lastError)
-      toast(
-        t("deposit.pendingConfirmation") ||
-          "Оплата пройшла, але зарахування затримується. Баланс з'явиться протягом кількох хвилин, або зверніться до підтримки.",
-        "info",
-      )
-      onClose()
     } else {
       addTon(total)
       recordDeposit(total)
@@ -111,8 +142,23 @@ async function sendTon() {
       else toast(t("deposit.success", { n: total }), "win")
       setAppliedBonus(null)
       onClose()
+      setSending(false)
     }
-    setSending(false)
+  }
+
+  // Ручна перевірка для "завислого" мосту / вичерпаних спроб: питаємо сервер
+  // ще раз, покладаючись лише на суму + адресу гаманця (без boc/txHash).
+  async function checkManually() {
+    const n = pendingAmountRef.current
+    if (!n || !walletAddress) return
+    setManualChecking(true)
+    try {
+      const ok = await confirmWithRetries(n, "", undefined)
+      if (ok) setWalletStuck(false)
+      else toast(t("deposit.stillNotFound") || "Оплату поки не знайдено на блокчейні. Спробуй ще раз за хвилину.", "error")
+    } finally {
+      setManualChecking(false)
+    }
   }
 
   async function sha256Hex(str: string) {
@@ -278,6 +324,22 @@ async function sendTon() {
             )}
             {!walletAddress && (
               <p className="mb-3 text-center text-xs text-[#7cc4ff]">{t("deposit.connectHint")}</p>
+            )}
+            {walletStuck && (
+              <div className="mb-3 rounded-xl px-3 py-3 text-center text-sm"
+                style={{ background: "rgba(255,214,0,0.08)", border: "1px solid rgba(255,214,0,0.3)" }}>
+                <p className="mb-2 font-semibold text-[#ffe88a]">
+                  Гаманець не відповів вчасно. Якщо ти вже підтвердив оплату в Tonkeeper — перевір ще раз.
+                </p>
+                <button
+                  onClick={checkManually}
+                  disabled={manualChecking}
+                  className="rounded-xl px-4 py-2 text-sm font-bold disabled:opacity-60"
+                  style={{ background: "rgba(255,214,0,0.9)", color: "#1a1400" }}
+                >
+                  {manualChecking ? "Перевіряємо…" : "Я вже оплатив — перевірити"}
+                </button>
+              </div>
             )}
             <button onClick={sendTon} disabled={sending}
               className="btn-3d w-full rounded-2xl py-4 text-base font-extrabold disabled:cursor-not-allowed disabled:opacity-70">
