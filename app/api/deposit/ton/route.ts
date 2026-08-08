@@ -101,6 +101,30 @@ function normAddr(a: string) {
   return a.replace(/[^a-zA-Z0-9_-]/g, "").toLowerCase()
 }
 
+// TON addresses come in two encodings that share no common substring:
+//   raw:      "0:a1b2c3...64hexchars"
+//   friendly: base64url, e.g. "EQAfazCyjGjugOf73_LrxUuLvxSmExM_8loArhgATwKXU6yA"
+// tonapi.io reports the sender in raw form; TonConnect gives us friendly form.
+// Comparing them as plain strings (old normAddr substring check) always fails
+// even for the exact same wallet — decode both to "workchain:hexhash" instead.
+function toRawTonAddress(addr: string): string | null {
+  const a = (addr || "").trim()
+  if (!a) return null
+  const rawMatch = a.match(/^(-?\d+):([0-9a-fA-F]{64})$/)
+  if (rawMatch) return `${rawMatch[1]}:${rawMatch[2].toLowerCase()}`
+  try {
+    const b64 = a.replace(/-/g, "+").replace(/_/g, "/")
+    const buf = Buffer.from(b64, "base64")
+    // flags(1) + workchain(1, signed) + hash(32) + crc16(2) = 36 bytes
+    if (buf.length !== 36) return null
+    const workchain = buf.readInt8(1)
+    const hash = buf.subarray(2, 34).toString("hex")
+    return `${workchain}:${hash}`
+  } catch {
+    return null
+  }
+}
+
 async function findMatchingTreasuryTx(
   amount: number,
   fromAddress: string,
@@ -109,6 +133,7 @@ async function findMatchingTreasuryTx(
   if (!treasury) return { ok: false, error: "treasury_not_configured" }
   const fromNorm = normAddr(fromAddress)
   if (fromNorm.length < 10) return { ok: false, error: "bad_wallet" }
+  const fromRaw = toRawTonAddress(fromAddress)
 
   try {
     const nano = Math.round(amount * 1e9)
@@ -126,10 +151,19 @@ async function findMatchingTreasuryTx(
       const inMsg = tx?.in_msg || tx?.inMsg
       const val = Number(inMsg?.value || 0)
       if (Math.abs(val - nano) > Math.max(1e6, nano * 0.02)) continue
-      const src = normAddr(String(inMsg?.source?.address || inMsg?.source || tx?.account?.address || ""))
-      // Require sender match when tonapi exposes it (prevents claim-stealing).
-      if (src && src.length >= 10 && !src.includes(fromNorm.slice(0, 12)) && !fromNorm.includes(src.slice(0, 12))) {
-        continue
+      const srcAddrRaw = String(inMsg?.source?.address || inMsg?.source || tx?.account?.address || "")
+      const srcRaw = toRawTonAddress(srcAddrRaw)
+      // Compare properly-decoded raw addresses when both sides parse cleanly.
+      // If either side fails to decode (unexpected format), don't hard-fail
+      // the whole match on address alone — amount + 15min window already do
+      // most of the work; a full string-substring fallback catches same-encoding cases.
+      if (srcRaw && fromRaw) {
+        if (srcRaw !== fromRaw) continue
+      } else {
+        const src = normAddr(srcAddrRaw)
+        if (src && src.length >= 10 && !src.includes(fromNorm.slice(0, 12)) && !fromNorm.includes(src.slice(0, 12))) {
+          continue
+        }
       }
       const hash = String(tx?.hash || tx?.transaction_id?.hash || "")
       if (hash) candidates.push(hash)
