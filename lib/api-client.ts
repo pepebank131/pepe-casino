@@ -469,7 +469,7 @@ export async function savePromos(promos: PromoCodeItem[], adminId?: string): Pro
 }
 
 // Player: redeem a promo code.
-export async function redeemPromo(code: string): Promise<{ ok: boolean; type?: "ton" | "percent" | "case"; reward?: number; bonusPercent?: number; caseId?: string; error?: string }> {
+export async function redeemPromo(code: string): Promise<{ ok: boolean; type?: "ton" | "percent" | "case"; reward?: number; bonusPercent?: number; caseId?: string; promoToken?: string; error?: string }> {
   const res = await fetch("/api/promos/redeem", {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-telegram-init-data": getInitData() },
