@@ -35,7 +35,7 @@ function useCountdown(targetMs: number) {
 }
 
 export function CasesScreen() {
-  const [spinCase, setSpinCase] = useState<{ def: CaseDef; mode: "paid" | "free" | "deposit" | "referral" | "promo" } | null>(null)
+  const [spinCase, setSpinCase] = useState<{ def: CaseDef; mode: "paid" | "free" | "deposit" | "referral" | "promo"; promoToken?: string } | null>(null)
   const [showSubGate, setShowSubGate] = useState(false)
   const [pendingFreeCase, setPendingFreeCase] = useState<CaseDef | null>(null)
   const [promoPrompt, setPromoPrompt] = useState<CaseDef | null>(null) // case waiting for promo code
@@ -254,6 +254,7 @@ export function CasesScreen() {
           free={spinCase.mode === "free" || spinCase.mode === "promo"}
           deposit={spinCase.mode === "deposit"}
           referral={spinCase.mode === "referral"}
+          promoToken={spinCase.promoToken}
           onClose={() => setSpinCase(null)}
         />
       )}
@@ -263,9 +264,9 @@ export function CasesScreen() {
         <PromoCaseModal
           caseDef={promoPrompt}
           onClose={() => setPromoPrompt(null)}
-          onSuccess={() => {
+          onSuccess={(promoToken) => {
             setPromoPrompt(null)
-            setSpinCase({ def: promoPrompt, mode: "promo" })
+            setSpinCase({ def: promoPrompt, mode: "promo", promoToken })
           }}
         />
       )}
@@ -548,7 +549,7 @@ function CaseCoverImage({ caseDef }: { caseDef: CaseDef }) {
 function PromoCaseModal({ caseDef, onClose, onSuccess }: {
   caseDef: CaseDef
   onClose: () => void
-  onSuccess: () => void
+  onSuccess: (promoToken: string) => void
 }) {
   const [code, setCode] = useState("")
   const [loading, setLoading] = useState(false)
@@ -575,12 +576,12 @@ function PromoCaseModal({ caseDef, onClose, onSuccess }: {
         setError(msgs[res.error || ""] || t("deposit.promoInvalid"))
         return
       }
-      if (res.type !== "case") {
+      if (res.type !== "case" || !res.promoToken) {
         setError(t("deposit.promoInvalid"))
         return
       }
       toast(t("deposit.promoActivatedCase"), "win")
-      onSuccess()
+      onSuccess(res.promoToken)
     } catch {
       setError(t("deposit.promoNetworkError"))
     } finally {
